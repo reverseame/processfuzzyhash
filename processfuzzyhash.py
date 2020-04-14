@@ -33,7 +33,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
           -E: Process expression. Will hash processes that contain given string in the name.
                 (-E svchost | -E winlogon,explorer)
 
-          -A: Algorithm to use. Aviable: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
+          -A: Algorithm to use. Available: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
                 (-A ssdeep | -A SSDeep | -A SSDEEP,sdHash,TLSH,dcfldd)
 
          --mode:

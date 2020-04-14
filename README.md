@@ -5,6 +5,12 @@ an executable file, i.e, a process, is likely to be different from other instanc
 
 This plugin also allows the user to choose the parts of the process to be hashed. Following the Windows PE format, we allow to choose between the whole PE, the full process address space, specific PE (or section) headers, loaded modules and memory pages, among others.
 
+Available algothimms to calculate fuzzy hashes:
+- [ssdeep](https://ssdeep-project.github.io/ssdeep/index.html)
+- [sdhash](http://roussev.net/sdhash/sdhash.html)
+- [TLSH](https://github.com/trendmicro/tlsh)
+- [dcfldd](http://dcfldd.sourceforge.net/)
+
 ## Installation
 
 You can install all dependencies with [setup.sh](setup.sh):
@@ -18,7 +24,7 @@ You can install all dependencies with [setup.sh](setup.sh):
 
 ```
 ---------------------------------
-Module MalScan
+Module ProcessFuzzyHash
 ---------------------------------
 
 Calculate and compare Windows processes fuzzy hashes
@@ -31,7 +37,7 @@ Calculate and compare Windows processes fuzzy hashes
         -E: Process expression. Will hash processes that contain given string in the name.
             (-E svchost | -E winlogon,explorer)
 
-        -A: Algorithm to use. Aviable: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
+        -A: Algorithm to use. Available: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
             (-A ssdeep | -A SSDeep | -A SSDEEP,sdHash,TLSH,dcfldd)
 
         --mode:
