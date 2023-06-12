@@ -11,6 +11,8 @@ Available algothimms to calculate fuzzy hashes:
 - [TLSH](https://github.com/trendmicro/tlsh)
 - [dcfldd](http://dcfldd.sourceforge.net/)
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 ## Installation
 
 You can install all dependencies with [setup.sh](setup.sh):
