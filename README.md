@@ -47,6 +47,7 @@ Calculate and compare Windows processes fuzzy hashes
             dll: loaded modules (--mode dll)
             vad: memory pages (--mode vad)
             full: whole process address space (--mode full)
+            driver: kernel drivers (--mode driver)
 
         -S: Section to hash
             PE section (-S .text | -S .data,.rsrc)

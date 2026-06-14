@@ -73,8 +73,14 @@ class SDHash(object):
         if re.search(r'^Error:', hash1) or re.search(r'^Error:', hash2):
             return '0'
 
-        # Bad hash comparation
-        return fuzzyhashlib.sdhash(hash=hash1) - fuzzyhashlib.sdhash(hash=hash2)
+        # Rebuild both digests from their stored representation and let
+        # fuzzyhashlib compute the similarity score (0-100). Reconstructing
+        # from a string can raise if the digest is malformed/truncated, so
+        # guard the comparison instead of letting it abort the whole render.
+        try:
+            return fuzzyhashlib.sdhash(hash=hash1) - fuzzyhashlib.sdhash(hash=hash2)
+        except (ValueError, TypeError) as reason:
+            return 'Error: {0}'.format(reason)
 
 class TLSH(object):
     def __init__(self):
@@ -92,7 +98,12 @@ class TLSH(object):
         return fingerprint if fingerprint else 'Error: empty hash'
 
     def compare(self, hash1, hash2):
-        return tlsh.diffxlen(hash1, hash2)
+        # diffxlen raises on malformed digests (e.g. comparing against a hash
+        # produced by a different algorithm); don't let it abort the render.
+        try:
+            return tlsh.diffxlen(hash1, hash2)
+        except (ValueError, TypeError) as reason:
+            return 'Error: {0}'.format(reason)
 
 class Dcfldd(object):
     def __init__(self):

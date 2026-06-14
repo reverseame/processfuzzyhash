@@ -15,9 +15,10 @@ MD5, SHA1, SHA256, CTPH = range(4)
 
 def hash(data, blocks, hash_f):
     dcfldd_hash = ''
-    # Data length
-    bs = math.ceil(len(data) / float(blocks))
-    bs = int(bs)
+    # Data length. Avoid a zero block size on empty input, which would make
+    # range()/the hash loop raise instead of producing a hash.
+    bs = int(math.ceil(len(data) / float(blocks)))
+    bs = max(1, bs)
 
     # hash function
     if hash_f == MD5:

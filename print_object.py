@@ -8,6 +8,9 @@ class PrintObject(object):
     def get_filename(self, task):
         for mod in task.get_load_modules():
             return mod.BaseDllName
+        # Fall back to the kernel _EPROCESS image name when the PEB module
+        # list is empty/paged out, instead of returning None.
+        return task.ImageFileName
 
     def get_hash(self):
         self._hash = self.hash_engine.calculate(data=self.data) if not self._hash else self._hash

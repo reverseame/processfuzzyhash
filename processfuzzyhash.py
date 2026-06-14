@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 import pefile
 
 import volatility.obj as obj
@@ -41,6 +42,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
               dll: loaded modules (--mode dll)
               vad: memory pages (--mode vad)
               full: whole process address space (--mode full)
+              driver: kernel drivers (--mode driver)
 
           -S: Section to hash
                PE section (-S .text | -S .data,.rsrc)
@@ -78,10 +80,10 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
     def __init__(self, config, *args, **kwargs):
         AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
         self._config.add_option('PID', short_option='P', help='Process ID', action='store',type='str')
-        self._config.add_option('PROC-EXPRESSION', short_option='N', help='Expression containing process name', action='store', type='str')
-        self._config.add_option('PROC-NAME', short_option='E', help='Process name', action='store', type='str')
+        self._config.add_option('PROC-NAME', short_option='N', help='Process name', action='store', type='str')
+        self._config.add_option('PROC-EXPRESSION', short_option='E', help='Expression containing process name', action='store', type='str')
         self._config.add_option('ALGORITHM', short_option='A', default='ssdeep', help='Hash algorithm', action='store', type='str')
-        self._config.add_option('MODE', help='Dump mode: pe, dll, vad, full', action='store', type='str')
+        self._config.add_option('MODE', help='Dump mode: pe, dll, vad, full, driver', action='store', type='str')
         self._config.add_option('SECTION', short_option='S', help='PE section to hash', action='store', type='str')
         self._config.add_option('PROTECTION', help='Filter VAD by protection', action='append', type='str')
         self._config.add_option('EXECUTABLE', short_option='X', help='Only show executable pages (VAD)', action='store_true')
@@ -90,6 +92,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         self._config.add_option('HUMAN-READABLE', short_option='H', help='Show human readable values', action='store_true')
         self._config.add_option('STRINGS', short_option='s', help='Hash strings contained in binary data', action='store_true')
         self._config.add_option('TMP-FOLDER', short_option='T', help='Temp folder to write all data', action='store', type='str')
+        self._config.add_option('KEEP', short_option='V', help='Keep hashed data on disk', action='store_true')
         self._config.add_option('NO-DEVICE', help='Don\'t show memory pages with devices associated', action='store_true')
         self._config.add_option('LIST-SECTIONS', help='Show PE sections', action='store_true')
         self._config.add_option('JSON', help='Print JSON output', action='store_true')
@@ -98,6 +101,8 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         """Main volatility plugin function"""
         try:
             self.addr_space = utils.load_as(self._config)
+            # Walk the process list once and reuse it everywhere.
+            self.proc_list = list(tasks.pslist(self.addr_space))
             self.validate_options()
 
             self.hash_engines = self.get_hash_engines()
@@ -106,12 +111,14 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
             if not pids:
                 debug.error('{0}: Could not find any processes with those options'.format(self.get_plugin_name()))
 
-            # Get hashes to compare to
+            # Get hashes to compare to. -c/-C can be given multiple times
+            # (action='append') and each value may itself be comma-separated.
             hashes = []
             if self._config.COMPARE_HASH:
-                hashes = self._config.COMPARE_HASH[0].split(',')
+                hashes = [h for entry in self._config.COMPARE_HASH for h in entry.split(',') if h]
             elif self._config.COMPARE_FILE:
-                hashes = self.read_hash_files(self._config.COMPARE_FILE[0].split(','))
+                files = [f for entry in self._config.COMPARE_FILE for f in entry.split(',') if f]
+                hashes = self.read_hash_files(files)
 
             for dump in self.make_dumps(pids, self._config.MODE):
                 if hashes:
@@ -172,7 +179,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
 
         ret = []
 
-        for proc in tasks.pslist(self.addr_space):
+        for proc in self.proc_list:
             for name in names:
                 if re.search(r'^{0}$'.format(name), str(self.get_exe_module(proc)), flags=re.IGNORECASE):
                     ret += [proc.UniqueProcessId]
@@ -189,6 +196,9 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         """
         for mod in task.get_load_modules():
             return mod.BaseDllName
+        # Fall back to the kernel _EPROCESS image name when the PEB module
+        # list is empty/paged out, instead of returning None.
+        return task.ImageFileName
 
     def get_proc_by_pid(self, pids):
         """
@@ -203,13 +213,13 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
 
         if pids:
             pids = pids.split(',')
-            for proc in tasks.pslist(self.addr_space):
+            for proc in self.proc_list:
                 # Check if those pids exist in memory dump file
                 if str(proc.UniqueProcessId) in pids:
                     ret += [proc.UniqueProcessId]
         else:
             # Return all pids if none is provided
-            for proc in tasks.pslist(self.addr_space):
+            for proc in self.proc_list:
                 # Only return those which are currently running
                 if not proc.ExitTime:
                     ret += [proc.UniqueProcessId]
@@ -254,16 +264,16 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         @returns a list of PEObject
         """
 
-        for task in tasks.pslist(self.addr_space):
+        for task in self.proc_list:
             if task.UniqueProcessId in pids:
                 task_space = task.get_process_address_space()
                 create_time = str(task.CreateTime) if self._config.HUMAN_READABLE else int(task.CreateTime)
                 pe_full_data = self.get_all_pe_pages(task_space)
+                if self._config.TMP_FOLDER:
+                    dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.dmp'.format(str(task.UniqueProcessId)))
+                    self.backup_file(dump_path, pe_full_data)
                 for engine in self.hash_engines:
                     yield PEObject(task, pe_full_data, engine, create_time, 'full')
-                    if self._config.TMP_FOLDER:
-                        dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.dmp'.format(str(task.UniqueProcessId)))
-                        self.backup_file(dump_path, pe_full_data)
 
     def get_all_pe_pages(self, ps_space):
         """
@@ -272,19 +282,19 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
 
         @param ps_space: process address space
         """
-        ret = b''
+        ret = []
 
         pages = ps_space.get_available_pages()
         if pages:
             for page in pages:
                 data = ps_space.read(page[0], page[1])
                 if data:
-                    ret += data
+                    ret.append(data)
 
-        return ret
+        return b''.join(ret)
 
     def driver_dump(self):
-        procs = list(tasks.pslist(self.addr_space))
+        procs = list(self.proc_list)
         mods = dict((mod.DllBase.v(), mod) for mod in modules.lsmod(self.addr_space))
         for mod in mods.values():
             mod_base = mod.DllBase.v()
@@ -297,11 +307,11 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
                 else:
                     sections = self.process_section(None, self._config.SECTION, pe_data)
                     for sec in sections:
+                        if self._config.TMP_FOLDER:
+                            dump_path = os.path.join(self._config.TMP_FOLDER, 'driver.{0:x}.{1}{2}.sys'.format(mod_base, mod.BaseDllName, self.safe_section(sec['section'])))
+                            self.backup_file(dump_path, sec['data'])
                         for engine in self.hash_engines:
                             yield DriverObject(sec['data'], mod_base, mode_end, mod.FullDllName, engine, sec['section'])
-                            if self._config.TMP_FOLDER:
-                                dump_path = os.path.join(self._config.TMP_FOLDER, 'driver.{0:x}.{1}{2}.sys'.format(mod_base, mod.BaseDllName, sec['section']))
-                                self.backup_file(dump_path, sec['data'])
 
     def pe_dump(self, pids):
         """
@@ -313,7 +323,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         @returns a list of PEObject sorted by pid
         """
 
-        for task in tasks.pslist(self.addr_space):
+        for task in self.proc_list:
             if task.UniqueProcessId in pids:
                 task_space = task.get_process_address_space()
                 # Check if _PEB is available and not paged
@@ -327,25 +337,25 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
                             # Generate one dump Object for every section/header specified
                             sections = self.process_section(task, self._config.SECTION, pe_data)
                             for sec in sections:
+                                if self._config.TMP_FOLDER:
+                                    dump_path = os.path.join(self._config.TMP_FOLDER, 'executable.{0}.{1}{2}.exe'.format(task.UniqueProcessId, task.ImageFileName, self.safe_section(sec['section'])))
+                                    self.backup_file(dump_path, sec['data'])
                                 for engine in self.hash_engines:
                                     yield PEObject(task, sec['data'], engine, create_time, sec['section'])
-                                    if self._config.TMP_FOLDER:
-                                        dump_path = os.path.join(self._config.TMP_FOLDER, 'executable.{0}.{1}{2}.exe'.format(task.UniqueProcessId, task.ImageFileName, sec['section']))
-                                        self.backup_file(dump_path, sec['data'])
                     except pefile.PEFormatError, reason:
                         debug.warning('{0}: {1} ({2}): {3}'.format(self.get_plugin_name(), task.ImageFileName, task.UniqueProcessId, reason))
 
     def get_pe_content(self, space, base):
-        ret = b''
+        ret = []
         pe_file = obj.Object('_IMAGE_DOS_HEADER', offset=base, vm=space)
 
         try:
             for offset, code in pe_file.get_image():
-                ret += code
+                ret.append(code)
         except (ValueError, exceptions.SanityCheckException):
             pass
 
-        return ret
+        return b''.join(ret)
 
     def get_pe_sections(self, pe_data):
         ret = []
@@ -411,7 +421,9 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
 
         try:
             if header == 'header':
-                data = pe.__getattribute__(header)
+                # pefile has no '.header' attribute: the whole PE headers
+                # region spans from the start of the image up to SizeOfHeaders.
+                data = pe.__data__[:pe.OPTIONAL_HEADER.SizeOfHeaders]
             else:
                 # Try to get specified PE header
                 data = pe.__getattribute__(header).__pack__()
@@ -455,7 +467,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         # Filter any page bigger than 1GB
         filter = lambda x: x.Length < 0x40000000
 
-        for task in tasks.pslist(self.addr_space):
+        for task in self.proc_list:
             if task.UniqueProcessId in pids:
                 # Walking the VAD tree can be done in kernel AS, but to 
                 # carve the actual data, we need a valid process AS.
@@ -472,25 +484,25 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
                             if self.filter_vad(protection_string(vad.VadFlags.Protection), devicename):
                                 continue
                             vad_data = self.get_vad_content(vad, task_space)
+                            if self._config.TMP_FOLDER:
+                                dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.{1}.{2:x}-{3:x}.dmp'.format(task.ImageFileName, task.UniqueProcessId, vad.Start, vad.End))
+                                self.backup_file(dump_path, vad_data)
                             for engine in self.hash_engines:
                                 yield VADObject(task, vad_data, engine, vad, devicename)
-                                if self._config.TMP_FOLDER:
-                                    dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.{1}.{2:x}-{3:x}.dmp'.format(task.ImageFileName, task.UniqueProcessId, vad.Start, vad.End))
-                                    self.backup_file(dump_path, vad_data)
 
     def get_vad_content(self, vad, address_space):
-        ret = b''
+        ret = []
         offset = vad.Start
-        out_of_range = vad.Start + vad.Length 
+        out_of_range = vad.Start + vad.Length
         while offset < out_of_range:
             to_read = min(constants.SCAN_BLOCKSIZE, out_of_range - offset)
             data = address_space.zread(offset, to_read)
-            if not data: 
+            if not data:
                 break
-            ret += data
+            ret.append(data)
             offset += to_read
 
-        return ret
+        return b''.join(ret)
 
     def filter_vad(self, protection, devicename):
         if self._config.PROTECTION and (protection not in self._config.PROTECTION):
@@ -513,7 +525,7 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
 
         @returns a list of DLLObject sorted by (pid, mod.BaseAddress)
         """
-        for task in tasks.pslist(self.addr_space):
+        for task in self.proc_list:
             if task.UniqueProcessId in pids:
                 task_space = task.get_process_address_space()
                 mods = dict((mod.DllBase.v(), mod) for mod in task.get_load_modules())
@@ -529,11 +541,11 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
                             # Generate one dump Object for every section/header specified
                             sections = self.process_section(task, self._config.SECTION, pe_data)
                             for sec in sections:
+                                if self._config.TMP_FOLDER:
+                                    dump_path = os.path.join(self._config.TMP_FOLDER, 'module.{0}.{1}.{2}{3}.{4:x}.dll'.format(task.ImageFileName, task.UniqueProcessId, mod_name, self.safe_section(sec['section']), mod_base))
+                                    self.backup_file(dump_path, sec['data'])
                                 for engine in self.hash_engines:
                                     yield DLLObject(task, sec['data'], engine, mod_base, mod_end, mod_name, sec['section'])
-                                    if self._config.TMP_FOLDER:
-                                        dump_path = os.path.join(self._config.TMP_FOLDER, 'module.{0}.{1}.{2}{3}.{4:x}.dll'.format(task.ImageFileName, task.UniqueProcessId, mod_name, sec['section'], mod_base))
-                                        self.backup_file(dump_path, sec['data'])
 
     def compare_hash(self, dump, hash_):
         """Compare hash for every dump Object"""
@@ -557,14 +569,26 @@ class ProcessFuzzyHash(AbstractWindowsCommand):
         with open(path, 'wb') as f:
             return f.write(data)
 
+    def safe_section(self, section):
+        # ':' (used by '<section>:header') is not a valid filename char on
+        # some filesystems, so normalize it for on-disk dump names.
+        return str(section).replace(':', '.')
+
     def prepare_working_dir(self):
+        # Only persist dumped data on disk when requested (-V) or when an
+        # explicit temp folder is given (-T). When keeping data without a
+        # folder, fall back to a random folder under the system temp dir.
+        if not (self._config.KEEP or self._config.TMP_FOLDER):
+            return ''
+
         if self._config.TMP_FOLDER:
             temp_path = os.path.realpath(self._config.TMP_FOLDER)
             if not os.path.exists(temp_path):
                 os.makedirs(temp_path)
-            return temp_path
         else:
-            return ''
+            temp_path = tempfile.mkdtemp(prefix='processfuzzyhash_')
+
+        return temp_path
 
     def render_text(self, outfd, data):
         first = True
