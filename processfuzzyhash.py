@@ -290,7 +290,12 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
     # -- helpers ------------------------------------------------------------
     def _get_engines(self) -> List[_Engine]:
         engines = []
-        for alg in self.config["algorithm"]:
+        # vol3 list options split on spaces ("--algorithm tlsh dcfldd"); also
+        # accept the comma syntax ("--algorithm tlsh,dcfldd") for convenience.
+        requested = [
+            a for entry in self.config["algorithm"] for a in entry.split(",") if a
+        ]
+        for alg in requested:
             key = alg.lower()
             engine_cls = _ENGINES.get(key)
             if engine_cls is None:
