@@ -25,8 +25,9 @@
 > `-E`→`--expression`, `-A`→`--algorithm`, `-S`→`--section`,
 > `-s`→`--strings`, `-c`→`--compare`, `-C`→`--compare-file`,
 > `-X`→`--executable`, `--protection`/`--no-device` unchanged.
-> Create-time is rendered natively (no `-H`); on-disk dumping (`-T`/`-V`)
-> is not ported yet — use Volatility 3's own `--output-dir` workflow.
+> Create-time is rendered natively (no `-H`). On-disk dumping (`-T`/`-V`)
+> is now `--dump`; files are written to Volatility 3's output directory
+> (`-o <dir>`) and reported in a "File output" column.
 
 `ProcessFuzzyHash` for Volatility 2.6 aims at computing fuzzy hashes of processes in a Windows OS dump image. Fuzzy hashes are a subset of hashing functions that, contrary to other (cryptographic) hashing functions such as MD5, SHA-1, or SHA-256, try to preserve similarity between similar inputs (i.e., two similar inputs will generate a similar output). By Windows OS intrinsic characteristics, an instance of
 an executable file, i.e, a process, is likely to be different from other instance of the same executable.

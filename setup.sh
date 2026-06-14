@@ -1,34 +1,49 @@
 #!/bin/bash
+#
+# Dependency installer for ProcessFuzzyHash (Volatility 3 / Python 3).
+#
+# It installs the system libraries, creates a virtualenv and installs
+# Volatility 3 plus the fuzzy-hash backends used by the plugin.
+#
+# The original Volatility 2.6 installer (Python 2.7 + jessie-backports) is
+# preserved on the `volatility2-latest` branch.
+#
+# Override the virtualenv location with: VENV=/path/to/venv ./setup.sh
 
-if [ "$EUID" -ne 0 ]; then
-    echo "Root required"
-    exit
-fi
+set -e
 
-# System dependencies
-echo -e "\n[*] Installing system dependencies...\n"
-systemdeps="python2.7 python2.7-dev python2.7-pip ssdeep libfuzzy-dev git cmake libffi-dev libssl1.0.0 build-essential"
-echo -e "[*] Adding jessie-backports repository to source packages...\n"
-sudo cp jessie-backports.list /etc/apt/sources.list.d
-echo -e "[*] Updating list of available packages...\n"
+VENV="${VENV:-$HOME/.venv-vol3}"
+PLUGIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "[*] Installing system dependencies (sudo may prompt for a password)..."
 sudo apt-get update
-echo -e "\n[*] Installing system dependencies...\n"
-sudo apt-get install -y $systemdeps
+sudo apt-get install -y \
+    build-essential cmake git \
+    python3 python3-dev python3-venv python3-pip \
+    libfuzzy-dev libffi-dev ssdeep
 
-# Python2 dependencies
-echo -e "\n[*] Installing Python2 dependencies...\n"
-pythondeps="pycrypto distorm3 pefile ssdeep fuzzyhashlib"
-sudo pip2 install $pythondeps
+echo "[*] Creating a virtualenv at: $VENV"
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --upgrade pip wheel
 
-echo -e "\n[*] Installing TSLH manually...\n"
-git clone "https://github.com/trendmicro/tlsh.git" /tmp/tlsh/
-oldpwd=$(pwd)
-cd /tmp/tlsh/
-./make.sh
-cd py_ext
-python2 setup.py build
-sudo python2 setup.py install
-cd $oldpwd
-rm -rf /tmp/tlsh/
+echo "[*] Installing required Python 3 packages..."
+# volatility3: the framework; pefile: PE parsing; python-tlsh & ssdeep: hashing.
+# (dcfldd is bundled with the plugin -- pure Python, no dependency.)
+"$VENV/bin/pip" install volatility3 pefile python-tlsh ssdeep
 
-echo -e "\nDone!"
+echo "[*] Installing optional sdhash backend (fuzzyhashlib)..."
+"$VENV/bin/pip" install fuzzyhashlib || \
+    echo "    [!] fuzzyhashlib (sdhash) failed to install; the other algorithms still work."
+
+cat <<EOF
+
+Done!
+
+Run the plugin with the virtualenv's interpreter, e.g.:
+
+  $VENV/bin/vol -p "$PLUGIN_DIR" -f memory.dmp processfuzzyhash \\
+      --mode pe --algorithm ssdeep --name svchost.exe
+
+Available algorithms: ssdeep, tlsh, dcfldd (bundled) and -- if fuzzyhashlib
+installed above -- sdhash.
+EOF

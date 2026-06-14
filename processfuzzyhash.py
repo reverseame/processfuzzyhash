@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import logging
 import math
+import ntpath
 import re
 import string
 from typing import Iterable, List, Optional
@@ -260,6 +261,12 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                 default=False,
                 optional=True,
             ),
+            requirements.BooleanRequirement(
+                name="dump",
+                description="Also write the hashed data to disk",
+                default=False,
+                optional=True,
+            ),
             requirements.ListRequirement(
                 name="protection",
                 element_type=str,
@@ -437,6 +444,22 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
         missing = search_header.group(1) if search_header else section
         raise _pefile.PEFormatError("Section {0} not found".format(missing))
 
+    # -- output helpers -----------------------------------------------------
+    @staticmethod
+    def _safe(text) -> str:
+        # Keep dump file names filesystem-safe (':' from '<section>:header',
+        # path separators, etc.).
+        return re.sub(r"[^\w.\-]", "_", str(text))
+
+    def _dump(self, file_name: str, data: bytes) -> str:
+        try:
+            with self.open(file_name) as handle:
+                handle.write(data)
+                return handle.preferred_filename
+        except Exception as reason:  # noqa: BLE001 - report, never abort the run
+            vollog.debug("Unable to write %s: %s", file_name, reason)
+            return "Error outputting file"
+
     # -- memory reading helpers --------------------------------------------
     def _create_time(self, proc):
         try:
@@ -523,7 +546,10 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                 continue
             for sec in self._process_section(section, pe_data):
                 sec_str = "pe:{0}".format(sec["section"]) if sec["section"] else "pe"
-                yield (name, pid, ppid, ctime, sec_str), sec["data"]
+                dump_name = "pe.{0}.{1}.{2}.dmp".format(
+                    pid, self._safe(name), self._safe(sec["section"] or "pe")
+                )
+                yield (name, pid, ppid, ctime, sec_str), sec["data"], dump_name
 
     def _full_prefixes(self):
         for proc in self._selected_processes():
@@ -537,7 +563,7 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                 continue
             proc_layer = self.context.layers[proc_layer_name]
             data = self._read_full(proc_layer)
-            yield (name, pid, ppid, ctime, "full"), data
+            yield (name, pid, ppid, ctime, "full"), data, "full.{0}.dmp".format(pid)
 
     def _dll_prefixes(self):
         section = self.config.get("section", None)
@@ -576,7 +602,10 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                         format_hints.Hex(end),
                         label,
                     )
-                    yield prefix, sec["data"]
+                    dump_name = "dll.{0}.{1}.{2:#x}.{3}.dmp".format(
+                        pid, self._safe(mod_name), base, self._safe(sec["section"] or "pe")
+                    )
+                    yield prefix, sec["data"], dump_name
 
     def _vad_prefixes(self):
         kernel = self.context.modules[self.config["kernel"]]
@@ -628,7 +657,8 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                     protection,
                     file_str,
                 )
-                yield prefix, data
+                dump_name = "vad.{0}.{1:#x}-{2:#x}.dmp".format(pid, start, end)
+                yield prefix, data, dump_name
 
     def _driver_prefixes(self):
         section = self.config.get("section", None)
@@ -664,12 +694,20 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                     path,
                     sec_str,
                 )
-                yield prefix, sec["data"]
+                dump_name = "driver.{0:#x}.{1}.{2}.dmp".format(
+                    base,
+                    self._safe(ntpath.basename(path) or "driver"),
+                    self._safe(sec["section"] or "pe"),
+                )
+                yield prefix, sec["data"], dump_name
 
     # -- common row emitter ------------------------------------------------
     def _emit_rows(self, prefixes, engines, compare_hashes):
         strings = self.config["strings"]
-        for prefix, data in prefixes:
+        dump = self.config["dump"]
+        for prefix, data, dump_name in prefixes:
+            # Persist the raw data once per blob (not once per algorithm).
+            tail = (self._dump(dump_name, data),) if dump else ()
             blob = _ascii_strings(data) if strings else data
             for engine in engines:
                 digest = str(engine.calculate(blob))
@@ -677,9 +715,9 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
                 if compare_hashes:
                     for other in compare_hashes:
                         rate = engine.compare(other, digest)
-                        yield (0, row + (str(other), str(rate)))
+                        yield (0, row + (str(other), str(rate)) + tail)
                 else:
-                    yield (0, row)
+                    yield (0, row + tail)
 
     # -- list-sections ------------------------------------------------------
     def _list_sections_generator(self):
@@ -794,5 +832,7 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
         columns = columns + [("Algorithm", str), ("Generated Hash", str)]
         if compare_hashes:
             columns += [("Compared Hash", str), ("Rate", str)]
+        if self.config["dump"]:
+            columns += [("File output", str)]
 
         return renderers.TreeGrid(columns, self._emit_rows(prefixes, engines, compare_hashes))
