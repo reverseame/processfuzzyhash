@@ -1,131 +1,130 @@
-# ProcessFuzzyHash - Volatility Plugin
+# ProcessFuzzyHash - Volatility 3 Plugin
 
-> **Branch `volatility3`:** port to Volatility 3 / Python 3. All modes
-> (`pe`, `dll`, `vad`, `full`, `driver`) are ported. The complete, fixed
-> Volatility 2.6 version is preserved on the `volatility2-latest` branch.
-> The legacy usage notes below describe the Volatility 2 plugin (kept for
-> reference); the Volatility 3 invocation uses double-dash options instead.
->
-> Volatility 3 usage:
-> ```
-> # Hash the main executable of every svchost.exe with ssdeep
-> vol.py -p /path/to/processfuzzyhash -f memory.dump processfuzzyhash \
->        --mode pe --algorithm ssdeep --name svchost.exe
->
-> # Hash VAD executable pages of PID 1234 with tlsh and dcfldd
-> vol.py -p /path/to/processfuzzyhash -f memory.dump processfuzzyhash \
->        --mode vad --executable --pid 1234 --algorithm tlsh,dcfldd
->
-> # List PE sections of loaded DLLs
-> vol.py -p /path/to/processfuzzyhash -f memory.dump processfuzzyhash \
->        --mode dll --list-sections --expression chrome
-> ```
->
-> Option mapping vs. Volatility 2: `-P`→`--pid`, `-N`→`--name`,
-> `-E`→`--expression`, `-A`→`--algorithm`, `-S`→`--section`,
-> `-s`→`--strings`, `-c`→`--compare`, `-C`→`--compare-file`,
-> `-X`→`--executable`, `--protection`/`--no-device` unchanged.
-> Create-time is rendered natively (no `-H`). On-disk dumping (`-T`/`-V`)
-> is now `--dump`; files are written to Volatility 3's output directory
-> (`-o <dir>`) and reported in a "File output" column.
+`ProcessFuzzyHash` computes and compares fuzzy hashes of processes in a Windows
+memory image. Fuzzy hashes are hashing functions that, contrary to cryptographic
+hashes such as MD5, SHA-1 or SHA-256, preserve similarity between similar inputs
+(two similar inputs produce similar outputs). Because of how Windows manages
+memory, an in-memory instance of an executable is likely to differ from another
+instance of the same executable, so fuzzy hashing is well suited to cluster and
+compare them.
 
-`ProcessFuzzyHash` for Volatility 2.6 aims at computing fuzzy hashes of processes in a Windows OS dump image. Fuzzy hashes are a subset of hashing functions that, contrary to other (cryptographic) hashing functions such as MD5, SHA-1, or SHA-256, try to preserve similarity between similar inputs (i.e., two similar inputs will generate a similar output). By Windows OS intrinsic characteristics, an instance of
-an executable file, i.e, a process, is likely to be different from other instance of the same executable.
+The plugin lets you choose which part of the process to hash: the main
+executable PE, loaded modules (DLLs), individual VAD memory regions, the whole
+process address space, or kernel drivers; and, within a PE, specific sections or
+headers.
 
-This plugin also allows the user to choose the parts of the process to be hashed. Following the Windows PE format, we allow to choose between the whole PE, the full process address space, specific PE (or section) headers, loaded modules and memory pages, among others.
-
-Available algothimms to calculate fuzzy hashes:
+Available fuzzy hash algorithms:
 - [ssdeep](https://ssdeep-project.github.io/ssdeep/index.html)
 - [sdhash](http://roussev.net/sdhash/sdhash.html)
 - [TLSH](https://github.com/trendmicro/tlsh)
-- [dcfldd](http://dcfldd.sourceforge.net/)
+- [dcfldd](http://dcfldd.sourceforge.net/) (bundled, pure Python)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
+> **Volatility 2?** This is the Volatility 3 / Python 3 port. The original
+> (fixed) Volatility 2.6 plugin is preserved on the **`volatility2-latest`**
+> branch.
+
 ## Installation
 
-You can install all dependencies with [setup.sh](setup.sh):
+Requires [Volatility 3](https://github.com/volatilityfoundation/volatility3)
+and Python 3. [`setup.sh`](setup.sh) installs the system libraries, creates a
+virtualenv and installs Volatility 3 plus the hashing backends:
 
-- System: `python2.7-dev`, `ssdeep`, `libfuzzy-dev`, `cmake`, `libffi-dev`, `libssl1.0.0`, `build-essential`
-- Python 2.7: `pycrypto`, `distorm3`, `pefile`, `ssdeep`, `fuzzyhashlib`, `tlsh` (from https://github.com/trendmicro/tlsh)
+```
+./setup.sh                      # uses ~/.venv-vol3 by default
+VENV=/path/to/venv ./setup.sh   # or pick the virtualenv location
+```
 
-**NOTE**: Be aware that this script will add [jessie-backports.list](jessie-backports.list) to your sources.
+Dependencies:
+- System: `build-essential`, `cmake`, `libfuzzy-dev`, `libffi-dev`,
+  `python3-dev`, `python3-venv`, `ssdeep`
+- Python 3: `volatility3`, `pefile`, `python-tlsh`, `ssdeep`, and optionally
+  `fuzzyhashlib` (for sdhash)
+
+The hashing libraries are imported lazily: the plugin still loads if one is
+missing, and only the affected algorithm is disabled. `dcfldd` is bundled and
+needs no external dependency.
 
 ## Usage
 
-```
----------------------------------
-Module ProcessFuzzyHash
----------------------------------
-
-Calculate and compare Windows processes fuzzy hashes
-
-    Options:
-        -P: Process PID(s). Will hash given processes PIDs.
-            (-P 252 | -P 252,452,2852)
-        -N: Process Name. Will hash process that match given string.
-            (-N svchost.exe | -N winlogon.exe,explorer.exe)
-        -E: Process expression. Will hash processes that contain given string in the name.
-            (-E svchost | -E winlogon,explorer)
-
-        -A: Algorithm to use. Available: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
-            (-A ssdeep | -A SSDeep | -A SSDEEP,sdHash,TLSH,dcfldd)
-
-        --mode:
-            pe: main executable module (--mode pe)
-            dll: loaded modules (--mode dll)
-            vad: memory pages (--mode vad)
-            full: whole process address space (--mode full)
-            driver: kernel drivers (--mode driver)
-
-        -S: Section to hash
-            PE section (-S .text | -S .data,.rsrc)
-            PE header (-S header | -S header,NT_HEADERS)
-            PE section header (-S .text:header | -S .data,.rsrc:header)
-
-        -s: Hash ASCII strings instead of binary data.
-
-        -c: Compare given hash against generated hashes.
-            (E.g. -c '3:elHLlltXluBGqMLWvl:6HRlOBVrl')
-        -C: Compare given hashes' file against generated hashes.
-            (E.g. -C /tmp/hashfile.txt)
-
-        -H: Human readable values (Create Time)
-
-        -T: Temp folder. Random folder at %TEMP% will be used if none given.
-        -V: Keep hashed data on disk. Defaults to False.
-
-        -X: Only show executable pages (--mode vad -X)
-        --protection: Filter memory pages by protection string (--mode vad --protection PAGE_EXECUTE_READWRITE)
-        --no-device: Don't show memory pages with devices associated (--mode vad --no-device)
-
-        --output-file=<file>: Plugin output will be writen to given file.
-        --output=<format>: Output formatting. [text, dot, html, json, sqlite, quick, xlsx]
-
-        --list-sections: Show PE sections
-
-    Note:
-        - Supported PE header names (pefile): DOS_HEADER, NT_HEADERS, FILE_HEADER, 
-                                            OPTIONAL_HEADER, header
-        - Hashes' file given with -C must contain one hash per line.
-        - Params -c and -C can be given multiple times (E.g. vol.py (...) -c <hash1> -c <hash2>)"""
-```
-
-You need to provide this project path as [first parameter to Volatility](https://github.com/volatilityfoundation/volatility/wiki/Volatility-Usage#specifying-additional-plugin-directories):
+Pass the plugin directory with `-p` and select a `--mode`:
 
 ```
-$ python vol.py --plugins /path/to/processfuzzyhash --profile WinProfile -f /path/to/memory.dump processfuzzyhash -A ssdeep -N svchost --mode pe
-Volatility Foundation Volatility Framework 2.6
-
-Process     Pid  PPid Create Time Section Algorithm Generated Hash
-svchost.exe  440  524 1523815038  pe      SSDeep    384:ivv(...)bvKpK
-svchost.exe  660  524 1523815037  pe      SSDeep    384:ivv(...)bvKEK
-svchost.exe  764  524 1523815038  pe      SSDeep    384:ivv(...)bvKoK
-svchost.exe  848  524 1523815038  pe      SSDeep    384:ivv(...)bvKEK
-svchost.exe  904  524 1523815038  pe      SSDeep    384:ivv(...)vKkhK
-
-[... redacted ...]
+vol -p /path/to/processfuzzyhash -f memory.dmp processfuzzyhash --mode pe --algorithm ssdeep --name svchost.exe
 ```
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `--mode {pe,dll,vad,full,driver}` | What to hash (default `pe`). |
+| `--pid <pid> [...]` | Restrict to these process IDs. |
+| `--name <name> [...]` | Exact process name match (e.g. `svchost.exe`). |
+| `--expression <substr> [...]` | Substring match against the process name. |
+| `--algorithm <alg> [...]` | `ssdeep`, `sdhash`, `tlsh`, `dcfldd` (default `ssdeep`). Space- or comma-separated. |
+| `--section <sec>` | PE section/header: `.text`, `.data,.rsrc`, `header`, `NT_HEADERS`, `.text:header`, or `all`. |
+| `--strings` | Hash printable ASCII strings instead of raw bytes. |
+| `--compare <hash> [...]` | Compare each generated hash against the given hash(es); adds a `Rate` column. |
+| `--compare-file <path>` | Compare against a file with one hash per line. |
+| `--list-sections` | List PE sections instead of hashing (`pe`/`dll`/`driver`). |
+| `--dump` | Also write the hashed data to disk (Volatility 3 output dir, see `-o`); adds a `File output` column. |
+| `--protection <str> [...]` | `vad`: only hash regions with this protection string. |
+| `--executable` | `vad`: only hash executable regions. |
+| `--no-device` | `vad`: skip regions backed by a mapped file. |
+
+Notes:
+- Supported PE header names: `DOS_HEADER`, `NT_HEADERS`, `FILE_HEADER`,
+  `OPTIONAL_HEADER`, `header`.
+- Create time is rendered natively by Volatility 3.
+
+### Examples
+
+```
+# Main executable of every svchost.exe, with ssdeep
+vol -p . -f memory.dmp processfuzzyhash --mode pe --algorithm ssdeep --expression svchost
+
+# Executable VAD regions of lsass with TLSH
+vol -p . -f memory.dmp processfuzzyhash --mode vad --executable --algorithm tlsh --name lsass.exe
+
+# .text section of loaded DLLs, comparing against a known hash
+vol -p . -f memory.dmp processfuzzyhash --mode dll --section .text --algorithm tlsh --compare T1<...>
+
+# Hash kernel drivers
+vol -p . -f memory.dmp processfuzzyhash --mode driver --algorithm ssdeep
+
+# List PE sections of the main executables
+vol -p . -f memory.dmp processfuzzyhash --mode pe --list-sections
+
+# Write the dumped PEs to ./out while hashing
+vol -p . -o ./out -f memory.dmp processfuzzyhash --mode pe --dump --name lsass.exe
+```
+
+Example output (`--mode pe --algorithm ssdeep`, similar svchost.exe instances
+produce similar hashes — the point of fuzzy hashing):
+
+```
+Process      PID  PPID  Create Time              Section  Algorithm  Generated Hash
+svchost.exe  652  536   2022-10-24 12:09:24 UTC  pe       SSDeep     384:bvvWkXZVq+1t5...EbvKrPK
+svchost.exe  768  536   2022-10-24 12:09:28 UTC  pe       SSDeep     384:bvvWkXZVq+1t5...EbvKmPK
+```
+
+## Volatility 2 → Volatility 3 option mapping
+
+| Vol2 | Vol3 |
+| --- | --- |
+| `-P` | `--pid` |
+| `-N` | `--name` |
+| `-E` | `--expression` |
+| `-A` | `--algorithm` |
+| `-S` | `--section` |
+| `-s` | `--strings` |
+| `-c` | `--compare` |
+| `-C` | `--compare-file` |
+| `-X` | `--executable` |
+| `--protection`, `--no-device` | unchanged |
+| `-T` / `-V` | `--dump` (+ Volatility 3 `-o <dir>`) |
+| `-H` | not needed (native datetime) |
 
 ## License
 
