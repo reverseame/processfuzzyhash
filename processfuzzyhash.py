@@ -1,606 +1,501 @@
-import os
+# This file is part of ProcessFuzzyHash, ported to Volatility 3.
+# Licensed under the GNU AGPLv3 license (see LICENSE).
+#
+# ProcessFuzzyHash computes and compares fuzzy hashes of Windows processes
+# found in a memory image. This module is the Volatility 3 port; the original
+# Volatility 2 version lives on the `volatility2-latest` branch.
+"""Calculate and compare Windows processes fuzzy hashes (Volatility 3)."""
+
+import datetime
+import hashlib
+import logging
+import math
 import re
-import tempfile
-import pefile
+import string
+from typing import Iterable, List, Optional
 
-import volatility.obj as obj
-import volatility.debug as debug
-import volatility.utils as utils
-import volatility.win32.tasks as tasks
-import volatility.constants as constants
-import volatility.exceptions as exceptions
-import volatility.win32.modules as modules
-from volatility.plugins.common import AbstractWindowsCommand
+from volatility3.framework import constants, exceptions, interfaces, renderers
+from volatility3.framework.configuration import requirements
+from volatility3.framework.objects import utility
+from volatility3.framework.symbols import intermed
+from volatility3.framework.symbols.windows.extensions import pe
+from volatility3.plugins.windows import pslist
 
-from peobject import PEObject
-from dllobject import DLLObject
-from pe_section import PESection
-from driverobject import DriverObject
-from compareobject import CompareObject
-from vadobject import VADObject, protection_string
-from hashengine import HashEngine, InvalidAlgorithm
+vollog = logging.getLogger(__name__)
 
-PE_HEADERS = ['DOS_HEADER', 'NT_HEADERS', 'FILE_HEADER', 'OPTIONAL_HEADER', 'header']
+# Optional fuzzy-hash backends. Each is imported lazily so the plugin still
+# loads (and the remaining algorithms keep working) when a library is missing.
+try:
+    import ssdeep as _ssdeep
+except ImportError:
+    _ssdeep = None
+try:
+    import tlsh as _tlsh
+except ImportError:
+    _tlsh = None
+try:
+    import fuzzyhashlib as _fuzzyhashlib
+except ImportError:
+    _fuzzyhashlib = None
+try:
+    import pefile as _pefile
+except ImportError:
+    _pefile = None
 
-class ProcessFuzzyHash(AbstractWindowsCommand):
-    """
-        Calculate and compare Windows processes fuzzy hashes
+PE_HEADERS = ["DOS_HEADER", "NT_HEADERS", "FILE_HEADER", "OPTIONAL_HEADER", "header"]
 
-        Options:
-          -P: Process PID(s). Will hash given processes PIDs.
-                (-P 252 | -P 252,452,2852)
-          -N: Process Name. Will hash process that match given string.
-                (-N svchost.exe | -N winlogon.exe,explorer.exe)
-          -E: Process expression. Will hash processes that contain given string in the name.
-                (-E svchost | -E winlogon,explorer)
+_DCFLDD_BLOCKS = 100
+_PRINTABLE = frozenset(string.printable.encode("ascii"))
 
-          -A: Algorithm to use. Available: ssdeep, sdhash, tlsh, dcfldd. Default: ssdeep
-                (-A ssdeep | -A SSDeep | -A SSDEEP,sdHash,TLSH,dcfldd)
 
-         --mode:
-              pe: main executable module (--mode pe)
-              dll: loaded modules (--mode dll)
-              vad: memory pages (--mode vad)
-              full: whole process address space (--mode full)
-              driver: kernel drivers (--mode driver)
+# ---------------------------------------------------------------------------
+# dcfldd (piecewise hashing) -- pure Python, no external dependency
+# ---------------------------------------------------------------------------
+def _dcfldd_hash(data, blocks=_DCFLDD_BLOCKS):
+    # Avoid a zero block size on empty input, which would make range() raise.
+    bs = max(1, int(math.ceil(len(data) / float(blocks))))
+    hashes = [hashlib.md5(data[i:i + bs]).hexdigest() for i in range(0, len(data), bs)]
+    # Pad with hashes of zeroed blocks so every digest has `blocks` elements.
+    for _ in range(len(hashes), blocks):
+        hashes.append(hashlib.md5(b"\x00" * bs).hexdigest())
+    return "md5:" + ":".join(hashes)
 
-          -S: Section to hash
-               PE section (-S .text | -S .data,.rsrc)
-               PE header (-S header | -S header,NT_HEADERS)
-               PE section header (-S .text:header | -S .data,.rsrc:header)
 
-          -s: Hash ASCII strings instead of binary data.
+def _dcfldd_compare(hash1, hash2):
+    a = hash1.split(":")
+    b = hash2.split(":")
+    if a[0] != b[0]:
+        return "Error: cannot compare different hash functions"
+    if len(a) != len(b):
+        return "Error: cannot compare different hash sizes"
+    return sum(1 for x, y in zip(a[1:], b[1:]) if x == y)
 
-          -c: Compare given hash against generated hashes.
-                (E.g. -c '3:elHLlltXluBGqMLWvl:6HRlOBVrl')
-          -C: Compare given hashes' file against generated hashes.
-                (E.g. -C /tmp/hashfile.txt)
 
-          -H: Human readable values (Create Time)
+def _ascii_strings(data, minlen=4):
+    """Return the printable ASCII strings in `data` joined by newlines (bytes)."""
+    out = []
+    cur = bytearray()
+    for byte in data:
+        if byte in _PRINTABLE:
+            cur.append(byte)
+            continue
+        if len(cur) >= minlen:
+            out.append(bytes(cur))
+        cur = bytearray()
+    if len(cur) >= minlen:
+        out.append(bytes(cur))
+    return b"\n".join(out)
 
-          -T: Temp folder. Random folder at %TEMP% will be used if none given.
-          -V: Keep hashed data on disk. Defaults to False.
 
-          -X: Only show executable pages (--mode vad -X)
-          --protection: Filter memory pages by protection string (--mode vad --protection PAGE_EXECUTE_READWRITE)
-          --no-device: Don't show memory pages with devices associated (--mode vad --no-device)
+# ---------------------------------------------------------------------------
+# Hash engines
+# ---------------------------------------------------------------------------
+class _Engine:
+    name = ""
+    available = True
+    requirement = ""
 
-          --output-file=<file>: Plugin output will be writen to given file.
-          --output=<format>: Output formatting. [text, dot, html, json, sqlite, quick, xlsx]
+    def calculate(self, data):
+        raise NotImplementedError
 
-          --list-sections: Show PE sections
+    def compare(self, hash1, hash2):
+        raise NotImplementedError
 
-        Note:
-          - Supported PE header names (pefile): DOS_HEADER, NT_HEADERS, FILE_HEADER, 
-                                                OPTIONAL_HEADER, header
-          - Hashes' file given with -C must contain one hash per line.
-          - Params -c and -C can be given multiple times (E.g. vol.py (...) -c <hash1> -c <hash2>)
-    """
 
-    def __init__(self, config, *args, **kwargs):
-        AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
-        self._config.add_option('PID', short_option='P', help='Process ID', action='store',type='str')
-        self._config.add_option('PROC-NAME', short_option='N', help='Process name', action='store', type='str')
-        self._config.add_option('PROC-EXPRESSION', short_option='E', help='Expression containing process name', action='store', type='str')
-        self._config.add_option('ALGORITHM', short_option='A', default='ssdeep', help='Hash algorithm', action='store', type='str')
-        self._config.add_option('MODE', help='Dump mode: pe, dll, vad, full, driver', action='store', type='str')
-        self._config.add_option('SECTION', short_option='S', help='PE section to hash', action='store', type='str')
-        self._config.add_option('PROTECTION', help='Filter VAD by protection', action='append', type='str')
-        self._config.add_option('EXECUTABLE', short_option='X', help='Only show executable pages (VAD)', action='store_true')
-        self._config.add_option('COMPARE-HASH', short_option='c', help='Compare to given hash', action='append', type='str')
-        self._config.add_option('COMPARE-FILE', short_option='C', help='Compare to hashes\' file', action='append', type='str')
-        self._config.add_option('HUMAN-READABLE', short_option='H', help='Show human readable values', action='store_true')
-        self._config.add_option('STRINGS', short_option='s', help='Hash strings contained in binary data', action='store_true')
-        self._config.add_option('TMP-FOLDER', short_option='T', help='Temp folder to write all data', action='store', type='str')
-        self._config.add_option('KEEP', short_option='V', help='Keep hashed data on disk', action='store_true')
-        self._config.add_option('NO-DEVICE', help='Don\'t show memory pages with devices associated', action='store_true')
-        self._config.add_option('LIST-SECTIONS', help='Show PE sections', action='store_true')
-        self._config.add_option('JSON', help='Print JSON output', action='store_true')
+class _SSDeep(_Engine):
+    name = "SSDeep"
+    requirement = "the 'ssdeep' python package"
+    available = _ssdeep is not None
 
-    def calculate(self):
-        """Main volatility plugin function"""
+    def calculate(self, data):
+        return _ssdeep.hash(data)
+
+    def compare(self, hash1, hash2):
         try:
-            self.addr_space = utils.load_as(self._config)
-            # Walk the process list once and reuse it everywhere.
-            self.proc_list = list(tasks.pslist(self.addr_space))
-            self.validate_options()
+            return _ssdeep.compare(hash1, hash2)
+        except Exception as reason:  # ssdeep.InternalError and friends
+            return "Error: {0}".format(reason)
 
-            self.hash_engines = self.get_hash_engines()
 
-            pids = self.get_processes()
-            if not pids:
-                debug.error('{0}: Could not find any processes with those options'.format(self.get_plugin_name()))
+class _SDHash(_Engine):
+    name = "SDHash"
+    requirement = "the 'fuzzyhashlib' python package"
+    available = _fuzzyhashlib is not None
 
-            # Get hashes to compare to. -c/-C can be given multiple times
-            # (action='append') and each value may itself be comma-separated.
-            hashes = []
-            if self._config.COMPARE_HASH:
-                hashes = [h for entry in self._config.COMPARE_HASH for h in entry.split(',') if h]
-            elif self._config.COMPARE_FILE:
-                files = [f for entry in self._config.COMPARE_FILE for f in entry.split(',') if f]
-                hashes = self.read_hash_files(files)
+    def calculate(self, data):
+        try:
+            return _fuzzyhashlib.sdhash(data).hexdigest().strip()
+        except ValueError as reason:
+            return "Error: {0} ({1:d})".format(reason, len(data))
 
-            for dump in self.make_dumps(pids, self._config.MODE):
-                if hashes:
-                    for item in self.compare_hash(dump, hashes):
-                        yield item
-                else:
-                    yield dump
+    def compare(self, hash1, hash2):
+        if hash1.startswith("Error:") or hash2.startswith("Error:"):
+            return "0"
+        try:
+            return _fuzzyhashlib.sdhash(hash=hash1) - _fuzzyhashlib.sdhash(hash=hash2)
+        except (ValueError, TypeError) as reason:
+            return "Error: {0}".format(reason)
 
-        except KeyboardInterrupt:
-            debug.error('KeyboardInterrupt')
 
-    def validate_options(self):
-        # MODE is mandatory
-        if self._config.MODE:
-            return
-        debug.error('{0}: You must specify something to do (--mode or -h)'.format(self.get_plugin_name()))
+class _TLSH(_Engine):
+    name = "TLSH"
+    requirement = "the 'tlsh' (python-tlsh) package"
+    available = _tlsh is not None
 
-    def get_hash_engines(self):
-        ret = []
+    def calculate(self, data):
+        if len(data) < 50:
+            return "Error: TLSH requires buffer >= 50 in size ({0:d})".format(len(data))
+        fingerprint = _tlsh.hash(data)
+        return fingerprint if fingerprint else "Error: empty hash"
 
-        algorithms = self._config.ALGORITHM.split(',')
-        for alg in algorithms:
+    def compare(self, hash1, hash2):
+        try:
+            return _tlsh.diffxlen(hash1, hash2)
+        except (ValueError, TypeError) as reason:
+            return "Error: {0}".format(reason)
+
+
+class _Dcfldd(_Engine):
+    name = "dcfldd"
+    available = True
+
+    def calculate(self, data):
+        return _dcfldd_hash(data)
+
+    def compare(self, hash1, hash2):
+        return _dcfldd_compare(str(hash1), str(hash2))
+
+
+_ENGINES = {
+    "ssdeep": _SSDeep,
+    "sdhash": _SDHash,
+    "tlsh": _TLSH,
+    "dcfldd": _Dcfldd,
+}
+
+
+class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
+    """Calculate and compare Windows processes fuzzy hashes."""
+
+    _required_framework_version = (2, 0, 0)
+    _version = (3, 0, 0)
+
+    @classmethod
+    def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
+        return [
+            requirements.ModuleRequirement(
+                name="kernel",
+                description="Windows kernel",
+                architectures=["Intel32", "Intel64"],
+            ),
+            requirements.VersionRequirement(
+                name="pslist", component=pslist.PsList, version=(3, 0, 0)
+            ),
+            requirements.ChoiceRequirement(
+                name="mode",
+                description="What to hash",
+                choices=["pe"],
+                default="pe",
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="pid",
+                element_type=int,
+                description="Process IDs to include (all others excluded)",
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="name",
+                element_type=str,
+                description="Exact process name(s) to include (e.g. svchost.exe)",
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="expression",
+                element_type=str,
+                description="Substring(s) to match against the process name",
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="algorithm",
+                element_type=str,
+                description="Fuzzy hash algorithm(s): ssdeep, sdhash, tlsh, dcfldd",
+                default=["ssdeep"],
+                optional=True,
+            ),
+            requirements.StringRequirement(
+                name="section",
+                description=(
+                    "PE section/header to hash (e.g. .text | header | .text:header | all)"
+                ),
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="strings",
+                description="Hash printable ASCII strings instead of binary data",
+                default=False,
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="compare",
+                element_type=str,
+                description="Compare every generated hash against the given hash(es)",
+                optional=True,
+            ),
+            requirements.StringRequirement(
+                name="compare-file",
+                description="File with one hash per line to compare against",
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="list-sections",
+                description="List PE sections instead of hashing",
+                default=False,
+                optional=True,
+            ),
+        ]
+
+    # -- helpers ------------------------------------------------------------
+    def _get_engines(self) -> List[_Engine]:
+        engines = []
+        for alg in self.config["algorithm"]:
+            key = alg.lower()
+            engine_cls = _ENGINES.get(key)
+            if engine_cls is None:
+                vollog.error("'%s': invalid fuzzy hash algorithm", alg)
+                continue
+            engine = engine_cls()
+            if not engine.available:
+                vollog.error(
+                    "'%s': algorithm unavailable, install %s",
+                    alg,
+                    engine.requirement,
+                )
+                continue
+            engines.append(engine)
+        return engines
+
+    def _compare_hashes(self) -> List[str]:
+        hashes = []
+        if self.config.get("compare", None):
+            hashes.extend(self.config["compare"])
+        if self.config.get("compare-file", None):
             try:
-                ret += [HashEngine(alg, self._config.STRINGS)]
-            except InvalidAlgorithm, reason:
-                debug.error('{0}: \'{1}\': {2}'.format(self.get_plugin_name(), alg, reason))
-        return ret
+                with open(self.config["compare-file"]) as handle:
+                    hashes.extend(line.strip() for line in handle if line.strip())
+            except OSError as reason:
+                vollog.error("'%s': %s", self.config["compare-file"], reason)
+        return hashes
 
-    def get_processes(self):
-        """
-        Return all processes id by either name, expresion or pids
-
-        @returns a list containing all desired pids
-        """
-
-        pids = []
-
-        if self._config.PROC_NAME:
-            names = self._config.PROC_NAME.split(',')
-            pids = self.get_proc_by_name(names)
-        elif self._config.PROC_EXPRESSION:
-            # Prepare all processes names as regular expresions
-            names = '.*{0}.*'.format(self._config.PROC_EXPRESSION.replace(',', '.*,.*')).split(',')
-            pids = self.get_proc_by_name(names)
-        else:
-            pids = self.get_proc_by_pid(self._config.PID)
-
-        return pids
-
-    def get_proc_by_name(self, names):
-        """
-        Search all processes by process name
-
-        @para names: a list with all names to search
-
-        @returns a list of pids
-        """
-
-        ret = []
-
-        for proc in self.proc_list:
-            for name in names:
-                if re.search(r'^{0}$'.format(name), str(self.get_exe_module(proc)), flags=re.IGNORECASE):
-                    ret += [proc.UniqueProcessId]
-
-        return ret
-
-    def get_exe_module(self, task):
-        """
-        Return main exe module name
-
-        @para task: process
-
-        @returns exe filename
-        """
-        for mod in task.get_load_modules():
-            return mod.BaseDllName
-        # Fall back to the kernel _EPROCESS image name when the PEB module
-        # list is empty/paged out, instead of returning None.
-        return task.ImageFileName
-
-    def get_proc_by_pid(self, pids):
-        """
-        Search all processes which its pid matches
-
-        @para names: a list with all pids to search
-
-        @returns a list of pids
-        """
-
-        ret = []
-
-        if pids:
-            pids = pids.split(',')
-            for proc in self.proc_list:
-                # Check if those pids exist in memory dump file
-                if str(proc.UniqueProcessId) in pids:
-                    ret += [proc.UniqueProcessId]
-        else:
-            # Return all pids if none is provided
-            for proc in self.proc_list:
-                # Only return those which are currently running
-                if not proc.ExitTime:
-                    ret += [proc.UniqueProcessId]
-        
-        return [x for x in ret if x != 4]
-
-    def make_dumps(self, pids, mode):
-        """
-        Generate all dumps files
-
-        @param pids: processes to dump
-        @param mode: section mode
-
-        @return list of objects implementing PrintObject interface
-        """
-
-        self._config.TMP_FOLDER = self.prepare_working_dir()
-
-        # Generate dump files depending on section mode provided
-        if mode == 'pe':
-            for item in self.pe_dump(pids):
-                yield item
-        elif mode == 'dll':
-            for item in self.dll_dump(pids):
-                yield item
-        elif mode == 'vad':
-            for item in self.vad_dump(pids):
-                yield item
-        elif mode == 'driver':
-            for item in self.driver_dump():
-                yield item
-        elif mode == 'full':
-            for item in self.full_dump(pids):
-                yield item
-        
-    def full_dump(self, pids):
-        """
-        Generate single dump files containing all memory pages of processes
-
-        @param pids: pid list to dump
-
-        @returns a list of PEObject
-        """
-
-        for task in self.proc_list:
-            if task.UniqueProcessId in pids:
-                task_space = task.get_process_address_space()
-                create_time = str(task.CreateTime) if self._config.HUMAN_READABLE else int(task.CreateTime)
-                pe_full_data = self.get_all_pe_pages(task_space)
-                if self._config.TMP_FOLDER:
-                    dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.dmp'.format(str(task.UniqueProcessId)))
-                    self.backup_file(dump_path, pe_full_data)
-                for engine in self.hash_engines:
-                    yield PEObject(task, pe_full_data, engine, create_time, 'full')
-
-    def get_all_pe_pages(self, ps_space):
-        """
-        Write all available memory pages of a process address space to a
-        single file
-
-        @param ps_space: process address space
-        """
-        ret = []
-
-        pages = ps_space.get_available_pages()
-        if pages:
-            for page in pages:
-                data = ps_space.read(page[0], page[1])
-                if data:
-                    ret.append(data)
-
-        return b''.join(ret)
-
-    def driver_dump(self):
-        procs = list(self.proc_list)
-        mods = dict((mod.DllBase.v(), mod) for mod in modules.lsmod(self.addr_space))
-        for mod in mods.values():
-            mod_base = mod.DllBase.v()
-            mode_end = mod_base + mod.SizeOfImage
-            space = tasks.find_space(self.addr_space, procs, mod_base)
-            if space:
-                pe_data = self.get_pe_content(space, mod_base)
-                if self._config.LIST_SECTIONS:
-                    yield PESection(mod.BaseDllName, self.get_pe_sections(pe_data))
-                else:
-                    sections = self.process_section(None, self._config.SECTION, pe_data)
-                    for sec in sections:
-                        if self._config.TMP_FOLDER:
-                            dump_path = os.path.join(self._config.TMP_FOLDER, 'driver.{0:x}.{1}{2}.sys'.format(mod_base, mod.BaseDllName, self.safe_section(sec['section'])))
-                            self.backup_file(dump_path, sec['data'])
-                        for engine in self.hash_engines:
-                            yield DriverObject(sec['data'], mod_base, mode_end, mod.FullDllName, engine, sec['section'])
-
-    def pe_dump(self, pids):
-        """
-        Generate dump files containing the PE
-
-        @param pids: pid list to dump
-        @param section: process section
-
-        @returns a list of PEObject sorted by pid
-        """
-
-        for task in self.proc_list:
-            if task.UniqueProcessId in pids:
-                task_space = task.get_process_address_space()
-                # Check if _PEB is available and not paged
-                if task_space and task.Peb and task_space.vtop(task.Peb.ImageBaseAddress):
-                    pe_data = self.get_pe_content(task_space, task.Peb.ImageBaseAddress)
-                    create_time = str(task.CreateTime) if self._config.HUMAN_READABLE else int(task.CreateTime)
-                    try:
-                        if self._config.LIST_SECTIONS:
-                            yield PESection(self.get_exe_module(task), self.get_pe_sections(pe_data), task.UniqueProcessId)
-                        else:
-                            # Generate one dump Object for every section/header specified
-                            sections = self.process_section(task, self._config.SECTION, pe_data)
-                            for sec in sections:
-                                if self._config.TMP_FOLDER:
-                                    dump_path = os.path.join(self._config.TMP_FOLDER, 'executable.{0}.{1}{2}.exe'.format(task.UniqueProcessId, task.ImageFileName, self.safe_section(sec['section'])))
-                                    self.backup_file(dump_path, sec['data'])
-                                for engine in self.hash_engines:
-                                    yield PEObject(task, sec['data'], engine, create_time, sec['section'])
-                    except pefile.PEFormatError, reason:
-                        debug.warning('{0}: {1} ({2}): {3}'.format(self.get_plugin_name(), task.ImageFileName, task.UniqueProcessId, reason))
-
-    def get_pe_content(self, space, base):
-        ret = []
-        pe_file = obj.Object('_IMAGE_DOS_HEADER', offset=base, vm=space)
-
+    def _main_module_name(self, proc) -> str:
         try:
-            for offset, code in pe_file.get_image():
-                ret.append(code)
-        except (ValueError, exceptions.SanityCheckException):
-            pass
-
-        return b''.join(ret)
-
-    def get_pe_sections(self, pe_data):
-        ret = []
-        pe = pefile.PE(data=pe_data, fast_load=True)
-
-        for sec in pe.sections:
-            ret += [sec.Name.translate(None, '\x00')]
-
-        return ret
-
-    def process_section(self, task, section, pe_data):
-        """
-        Generate one dump file for every section
-
-        @param task: process
-        @param section: sections to dump
-        @param pe_data: PE data
-
-        @returns a list of dicts containing each section and dump path associated
-        """
-        if not section:
-            return [{'section': '', 'data': pe_data}]
-
-        ret = []
-
-        try:
-            pe = pefile.PE(data=pe_data, fast_load=True)
-            sections = [x for x in section.split(',') if x]
-
-            if 'all' in sections:
-                sections = self.get_pe_sections(pe_data)
-                ret = [{'section': 'PE', 'data': pe_data}]
-
-            sections = list(set(sections))
-
-            for sec in sections:
+            for entry in proc.load_order_modules():
                 try:
-                    if sec in PE_HEADERS:
-                        # PE header
-                        ret += [self.process_pe_header(pe, sec)]
-                    else:
-                        # PE section
-                        ret += [self.process_pe_section(pe, sec)]                    
-                except pefile.PEFormatError, reason:
-                    if task:
-                        debug.warning('{0}: {1} ({2}): {3}'.format(self.get_plugin_name(), task.ImageFileName, task.UniqueProcessId, reason))
-                    else:
-                        debug.warning('{0}: {1}'.format(self.get_plugin_name(), reason))
-        except pefile.PEFormatError:
+                    return str(entry.BaseDllName.get_string())
+                except exceptions.InvalidAddressException:
+                    break
+        except exceptions.InvalidAddressException:
             pass
+        # Fall back to the kernel _EPROCESS image name.
+        return utility.array_to_string(proc.ImageFileName)
 
-        return ret
+    def _image_base(self, proc) -> Optional[int]:
+        try:
+            for entry in proc.load_order_modules():
+                return int(entry.DllBase)
+        except exceptions.InvalidAddressException:
+            return None
+        return None
 
-    def process_pe_header(self, pe, header):
-        """
-        Retrieve desired PE header
+    def _selected_processes(self) -> Iterable[interfaces.objects.ObjectInterface]:
+        filter_func = pslist.PsList.create_pid_filter(self.config.get("pid", None))
+        procs = pslist.PsList.list_processes(
+            context=self.context,
+            kernel_module_name=self.config["kernel"],
+            filter_func=filter_func,
+        )
 
-        @param pe: PE object
-        @param header: PE header to search
+        names = [n.lower() for n in (self.config.get("name", None) or [])]
+        exprs = [e.lower() for e in (self.config.get("expression", None) or [])]
 
-        @return a dict containing header and dump file associated
-        """
+        for proc in procs:
+            if proc.UniqueProcessId == 4:
+                continue
+            if not names and not exprs:
+                yield proc
+                continue
+            modname = self._main_module_name(proc).lower()
+            if names and any(re.search(r"^{0}$".format(n), modname) for n in names):
+                yield proc
+            elif exprs and any(e in modname for e in exprs):
+                yield proc
+
+    def _reconstruct_pe(self, base: int, layer_name: str) -> bytes:
+        """Rebuild the PE image at `base` into a contiguous byte buffer."""
+        dos_header = self.context.object(
+            self._pe_table_name + constants.BANG + "_IMAGE_DOS_HEADER",
+            offset=base,
+            layer_name=layer_name,
+        )
+        buf = bytearray()
+        for offset, data in dos_header.reconstruct():
+            end = offset + len(data)
+            if end > len(buf):
+                buf.extend(b"\x00" * (end - len(buf)))
+            buf[offset:end] = data
+        return bytes(buf)
+
+    # -- PE section/header selection (pefile based) -------------------------
+    @staticmethod
+    def _section_name(section) -> str:
+        return section.Name.rstrip(b"\x00").decode("ascii", "replace")
+
+    def _section_names(self, pe_obj) -> List[str]:
+        return [self._section_name(sec) for sec in pe_obj.sections]
+
+    def _process_section(self, section: Optional[str], pe_data: bytes):
+        if not section:
+            return [{"section": "", "data": pe_data}]
+        if _pefile is None:
+            vollog.warning("pefile not available; hashing whole PE instead of a section")
+            return [{"section": "", "data": pe_data}]
 
         try:
-            if header == 'header':
-                # pefile has no '.header' attribute: the whole PE headers
-                # region spans from the start of the image up to SizeOfHeaders.
-                data = pe.__data__[:pe.OPTIONAL_HEADER.SizeOfHeaders]
-            else:
-                # Try to get specified PE header
-                data = pe.__getattribute__(header).__pack__()
-            return {'section': header, 'data': data}
+            pe_obj = _pefile.PE(data=pe_data, fast_load=True)
+        except _pefile.PEFormatError as reason:
+            vollog.debug("PEFormatError: %s", reason)
+            return []
+
+        requested = [x for x in section.split(",") if x]
+        ret = []
+        if "all" in requested:
+            requested = self._section_names(pe_obj)
+            ret.append({"section": "PE", "data": pe_data})
+
+        for sec in set(requested):
+            try:
+                if sec in PE_HEADERS:
+                    entry = self._pe_header(pe_obj, sec)
+                else:
+                    entry = self._pe_section(pe_obj, sec)
+                if entry:
+                    ret.append(entry)
+            except _pefile.PEFormatError as reason:
+                vollog.warning("%s", reason)
+        return ret
+
+    def _pe_header(self, pe_obj, header):
+        if header == "header":
+            # pefile has no '.header' attribute: the headers region spans the
+            # start of the image up to SizeOfHeaders.
+            size = pe_obj.OPTIONAL_HEADER.SizeOfHeaders
+            return {"section": header, "data": bytes(pe_obj.__data__[:size])}
+        try:
+            data = getattr(pe_obj, header).__pack__()
         except AttributeError:
-                debug.error('{0}: \'{1}\': Bad header option (DOS_HEADER, NT_HEADERS, FILE_HEADER, OPTIONAL_HEADER or header)'.format(self.get_plugin_name(), header.split(':')[-1]))
+            vollog.error(
+                "'%s': bad header option (DOS_HEADER, NT_HEADERS, FILE_HEADER, "
+                "OPTIONAL_HEADER or header)",
+                header,
+            )
+            return None
+        return {"section": header, "data": data}
 
-    def process_pe_section(self, pe, section):
-        """
-        Retrieve desired PE section
+    def _pe_section(self, pe_obj, section):
+        search_header = re.search(r"^(.+)(:header)$", section)
+        for sec in pe_obj.sections:
+            name = self._section_name(sec)
+            if search_header and search_header.group(1) == name:
+                return {"section": section, "data": sec.__pack__()}
+            if section == name:
+                return {"section": section, "data": sec.get_data()}
+        missing = search_header.group(1) if search_header else section
+        raise _pefile.PEFormatError("Section {0} not found".format(missing))
 
-        @param pe: PE object
-        @param header: PE section to search
+    # -- generators ---------------------------------------------------------
+    def _list_sections_generator(self):
+        for proc in self._selected_processes():
+            pid = int(proc.UniqueProcessId)
+            name = self._main_module_name(proc)
+            layer_name = proc.add_process_layer()
+            base = self._image_base(proc)
+            if base is None:
+                continue
+            try:
+                pe_data = self._reconstruct_pe(base, layer_name)
+                if _pefile is None:
+                    sections = "pefile not available"
+                else:
+                    pe_obj = _pefile.PE(data=pe_data, fast_load=True)
+                    sections = ", ".join(self._section_names(pe_obj))
+            except (exceptions.VolatilityException, ValueError) as reason:
+                vollog.debug("%s (%d): %s", name, pid, reason)
+                continue
+            yield (0, (name, pid, sections))
 
-        @return a dict containing section and dump file associated
-        """
+    def _hash_generator(self, engines, compare_hashes):
+        strings = self.config["strings"]
+        section = self.config.get("section", None)
 
-        search_header = re.search(r'^(.+)(:header)$', section)
+        for proc in self._selected_processes():
+            pid = int(proc.UniqueProcessId)
+            ppid = int(proc.InheritedFromUniqueProcessId)
+            name = self._main_module_name(proc)
+            try:
+                ctime = proc.get_create_time()
+            except exceptions.VolatilityException:
+                ctime = renderers.UnreadableValue()
 
-        # Iterate through all existing PE sections
-        for sec in pe.sections:
-            if search_header and search_header.group(1) == sec.Name.translate(None, '\x00'):
-                # Get section header
-                return {'section': section, 'data': sec.__pack__()}
-            elif section == sec.Name.translate(None, '\x00'):
-                # Get section data
-                return {'section': section, 'data': sec.get_data()}
+            layer_name = proc.add_process_layer()
+            base = self._image_base(proc)
+            if base is None:
+                continue
 
-        header = search_header.group(1) if search_header else section
-        raise pefile.PEFormatError('Section {0} not found'.format(header))
+            try:
+                pe_data = self._reconstruct_pe(base, layer_name)
+            except (exceptions.VolatilityException, ValueError) as reason:
+                vollog.debug("%s (%d): %s", name, pid, reason)
+                continue
 
-    def vad_dump(self, pids):
-        """
-        Generate dump files containing all process pages based on its Virtual Address Descriptors
+            for sec in self._process_section(section, pe_data):
+                data = _ascii_strings(sec["data"]) if strings else sec["data"]
+                sec_str = "pe:{0}".format(sec["section"]) if sec["section"] else "pe"
+                for engine in engines:
+                    digest = engine.calculate(data)
+                    base_row = (name, pid, ppid, ctime, sec_str, engine.name, str(digest))
+                    if compare_hashes:
+                        for other in compare_hashes:
+                            rate = engine.compare(other, str(digest))
+                            yield (0, base_row + (str(other), str(rate)))
+                    else:
+                        yield (0, base_row)
 
-        @param pids: pid list to dump
+    # -- entry point --------------------------------------------------------
+    def run(self):
+        self._pe_table_name = intermed.IntermediateSymbolTable.create(
+            self.context, self.config_path, "windows", "pe", class_types=pe.class_types
+        )
 
-        @returns a list of VADObject sorted by (pid, vad.StartAddress)
-        """
+        if self.config["list-sections"]:
+            columns = [("Process", str), ("PID", int), ("Sections", str)]
+            return renderers.TreeGrid(columns, self._list_sections_generator())
 
-        # Filter any page bigger than 1GB
-        filter = lambda x: x.Length < 0x40000000
+        engines = self._get_engines()
+        if not engines:
+            vollog.error("No usable hash algorithm available")
+            return renderers.TreeGrid([("Process", str)], iter(()))
 
-        for task in self.proc_list:
-            if task.UniqueProcessId in pids:
-                # Walking the VAD tree can be done in kernel AS, but to 
-                # carve the actual data, we need a valid process AS.
-                task_space = task.get_process_address_space()
-                if task_space:
-                    for vad, _ in task.get_vads(vad_filter=filter, skip_max_commit=True):
-                        if vad:
-                            devicename = ''
-                            try:
-                                # Try to get associated VAD module
-                                devicename = vad.FileObject.file_name_with_device()
-                            except AttributeError:
-                                pass
-                            if self.filter_vad(protection_string(vad.VadFlags.Protection), devicename):
-                                continue
-                            vad_data = self.get_vad_content(vad, task_space)
-                            if self._config.TMP_FOLDER:
-                                dump_path = os.path.join(self._config.TMP_FOLDER, '{0}.{1}.{2:x}-{3:x}.dmp'.format(task.ImageFileName, task.UniqueProcessId, vad.Start, vad.End))
-                                self.backup_file(dump_path, vad_data)
-                            for engine in self.hash_engines:
-                                yield VADObject(task, vad_data, engine, vad, devicename)
+        compare_hashes = self._compare_hashes()
+        columns = [
+            ("Process", str),
+            ("PID", int),
+            ("PPID", int),
+            ("Create Time", datetime.datetime),
+            ("Section", str),
+            ("Algorithm", str),
+            ("Generated Hash", str),
+        ]
+        if compare_hashes:
+            columns += [("Compared Hash", str), ("Rate", str)]
 
-    def get_vad_content(self, vad, address_space):
-        ret = []
-        offset = vad.Start
-        out_of_range = vad.Start + vad.Length
-        while offset < out_of_range:
-            to_read = min(constants.SCAN_BLOCKSIZE, out_of_range - offset)
-            data = address_space.zread(offset, to_read)
-            if not data:
-                break
-            ret.append(data)
-            offset += to_read
-
-        return b''.join(ret)
-
-    def filter_vad(self, protection, devicename):
-        if self._config.PROTECTION and (protection not in self._config.PROTECTION):
-            return True
-        if self._config.EXECUTABLE:
-            # Check if VAD's protection is executable
-            if not 'EXECUTE' in protection:
-                return True
-        if self._config.NO_DEVICE and devicename:
-            # Skip VADs with module associated
-            return True
-
-        return False
-
-    def dll_dump(self, pids):
-        """
-        Generate dump files containing all modules loaded by a process
-
-        @param pids: pid list to dump
-
-        @returns a list of DLLObject sorted by (pid, mod.BaseAddress)
-        """
-        for task in self.proc_list:
-            if task.UniqueProcessId in pids:
-                task_space = task.get_process_address_space()
-                mods = dict((mod.DllBase.v(), mod) for mod in task.get_load_modules())
-                for mod in mods.values():
-                    mod_base = mod.DllBase.v()
-                    mod_end = mod_base + mod.SizeOfImage
-                    if task_space.is_valid_address(mod_base):
-                        mod_name = mod.BaseDllName
-                        pe_data = self.get_pe_content(task_space, mod_base)
-                        if self._config.LIST_SECTIONS:
-                            yield PESection(mod_name, self.get_pe_sections(pe_data), task.UniqueProcessId, mod_base)
-                        else:
-                            # Generate one dump Object for every section/header specified
-                            sections = self.process_section(task, self._config.SECTION, pe_data)
-                            for sec in sections:
-                                if self._config.TMP_FOLDER:
-                                    dump_path = os.path.join(self._config.TMP_FOLDER, 'module.{0}.{1}.{2}{3}.{4:x}.dll'.format(task.ImageFileName, task.UniqueProcessId, mod_name, self.safe_section(sec['section']), mod_base))
-                                    self.backup_file(dump_path, sec['data'])
-                                for engine in self.hash_engines:
-                                    yield DLLObject(task, sec['data'], engine, mod_base, mod_end, mod_name, sec['section'])
-
-    def compare_hash(self, dump, hash_):
-        """Compare hash for every dump Object"""
-
-        for h in hash_:
-            yield CompareObject(dump, h)
-
-    def read_hash_files(self, paths):
-        ret = []
-
-        try:
-            for path in paths:
-                with open(path) as f:
-                    ret += [x.strip() for x in f.readlines()]
-        except IOError:
-            debug.error('{0}: \'{1}\': Can not open file'.format(self.get_plugin_name(), path))
-
-        return ret
-
-    def backup_file(self, path, data):
-        with open(path, 'wb') as f:
-            return f.write(data)
-
-    def safe_section(self, section):
-        # ':' (used by '<section>:header') is not a valid filename char on
-        # some filesystems, so normalize it for on-disk dump names.
-        return str(section).replace(':', '.')
-
-    def prepare_working_dir(self):
-        # Only persist dumped data on disk when requested (-V) or when an
-        # explicit temp folder is given (-T). When keeping data without a
-        # folder, fall back to a random folder under the system temp dir.
-        if not (self._config.KEEP or self._config.TMP_FOLDER):
-            return ''
-
-        if self._config.TMP_FOLDER:
-            temp_path = os.path.realpath(self._config.TMP_FOLDER)
-            if not os.path.exists(temp_path):
-                os.makedirs(temp_path)
-        else:
-            temp_path = tempfile.mkdtemp(prefix='processfuzzyhash_')
-
-        return temp_path
-
-    def render_text(self, outfd, data):
-        first = True
-        for item in data:
-            if self._config.json: 
-                outfd.write('{0}\n'.format(item._json()))
-            else:
-                if first:
-                    self.table_header(outfd, item.get_unified_output())
-                    first = False
-                # Transform list to arguments with * operator
-                self.table_row(outfd, *item.get_generator())
-
-    def get_plugin_name(self):
-        return os.path.splitext(os.path.basename(__file__))[0]
+        return renderers.TreeGrid(columns, self._hash_generator(engines, compare_hashes))

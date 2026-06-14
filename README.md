@@ -1,5 +1,17 @@
 # ProcessFuzzyHash - Volatility Plugin
 
+> **Branch `volatility3` (work in progress):** port to Volatility 3 / Python 3.
+> Currently only the `pe` mode is implemented; `dll`, `vad`, `full` and `driver`
+> are still being ported. The complete, fixed Volatility 2.6 version is preserved
+> on the `volatility2-latest` branch. Usage notes below still describe the
+> Volatility 2 plugin and will be updated as the port progresses.
+>
+> Volatility 3 usage (so far):
+> ```
+> vol.py -p /path/to/processfuzzyhash -f memory.dump processfuzzyhash \
+>        --mode pe --algorithm ssdeep --name svchost.exe
+> ```
+
 `ProcessFuzzyHash` for Volatility 2.6 aims at computing fuzzy hashes of processes in a Windows OS dump image. Fuzzy hashes are a subset of hashing functions that, contrary to other (cryptographic) hashing functions such as MD5, SHA-1, or SHA-256, try to preserve similarity between similar inputs (i.e., two similar inputs will generate a similar output). By Windows OS intrinsic characteristics, an instance of
 an executable file, i.e, a process, is likely to be different from other instance of the same executable.
 
