@@ -17,9 +17,10 @@ from typing import Iterable, List, Optional
 from volatility3.framework import constants, exceptions, interfaces, renderers
 from volatility3.framework.configuration import requirements
 from volatility3.framework.objects import utility
+from volatility3.framework.renderers import format_hints
 from volatility3.framework.symbols import intermed
 from volatility3.framework.symbols.windows.extensions import pe
-from volatility3.plugins.windows import pslist
+from volatility3.plugins.windows import modules, pslist, vadinfo
 
 vollog = logging.getLogger(__name__)
 
@@ -191,10 +192,16 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="pslist", component=pslist.PsList, version=(3, 0, 0)
             ),
+            requirements.VersionRequirement(
+                name="vadinfo", component=vadinfo.VadInfo, version=(2, 0, 0)
+            ),
+            requirements.VersionRequirement(
+                name="modules", component=modules.Modules, version=(3, 0, 0)
+            ),
             requirements.ChoiceRequirement(
                 name="mode",
                 description="What to hash",
-                choices=["pe"],
+                choices=["pe", "dll", "vad", "full", "driver"],
                 default="pe",
                 optional=True,
             ),
@@ -249,7 +256,25 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
             ),
             requirements.BooleanRequirement(
                 name="list-sections",
-                description="List PE sections instead of hashing",
+                description="List PE sections instead of hashing (pe/dll/driver)",
+                default=False,
+                optional=True,
+            ),
+            requirements.ListRequirement(
+                name="protection",
+                element_type=str,
+                description="vad: only hash pages with this protection string",
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="executable",
+                description="vad: only hash executable pages",
+                default=False,
+                optional=True,
+            ),
+            requirements.BooleanRequirement(
+                name="no-device",
+                description="vad: skip pages backed by a mapped file/device",
                 default=False,
                 optional=True,
             ),
@@ -412,63 +437,306 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
         missing = search_header.group(1) if search_header else section
         raise _pefile.PEFormatError("Section {0} not found".format(missing))
 
-    # -- generators ---------------------------------------------------------
-    def _list_sections_generator(self):
+    # -- memory reading helpers --------------------------------------------
+    def _create_time(self, proc):
+        try:
+            return proc.get_create_time()
+        except exceptions.VolatilityException:
+            return renderers.UnreadableValue()
+
+    @staticmethod
+    def _read_range(layer, start, size):
+        """Read [start, start+size) from a layer, padding unmapped pages."""
+        chunk = 1024 * 1024 * 10
+        out = []
+        offset = start
+        end = start + size
+        while offset < end:
+            to_read = min(chunk, end - offset)
+            try:
+                data = layer.read(offset, to_read, pad=True)
+            except exceptions.InvalidAddressException:
+                break
+            if not data:
+                break
+            out.append(data)
+            offset += to_read
+        return b"".join(out)
+
+    def _read_full(self, proc_layer):
+        """Read every mapped region of a process address space."""
+        out = []
+        for mapval in proc_layer.mapping(
+            0x0, proc_layer.maximum_address, ignore_errors=True
+        ):
+            offset, size = mapval[0], mapval[1]
+            try:
+                data = proc_layer.read(offset, size, pad=True)
+            except exceptions.InvalidAddressException:
+                continue
+            if data:
+                out.append(data)
+        return b"".join(out)
+
+    def _pe_section_list(self, base, layer_name):
+        if _pefile is None:
+            return "pefile not available"
+        try:
+            pe_data = self._reconstruct_pe(base, layer_name)
+            pe_obj = _pefile.PE(data=pe_data, fast_load=True)
+            return ", ".join(self._section_names(pe_obj))
+        except (exceptions.VolatilityException, ValueError, _pefile.PEFormatError) as reason:
+            vollog.debug("section list at %#x: %s", base, reason)
+            return None
+
+    def _filter_vad(self, protection, file_name):
+        wanted = self.config.get("protection", None)
+        if wanted and protection not in wanted:
+            return True
+        if self.config["executable"] and "EXECUTE" not in protection:
+            return True
+        if self.config["no-device"] and file_name:
+            return True
+        return False
+
+    # -- per-mode prefix generators ----------------------------------------
+    # Each yields (prefix_tuple, data_bytes); _emit_rows appends the
+    # algorithm/hash (and compare) columns common to every mode.
+    def _pe_prefixes(self):
+        section = self.config.get("section", None)
         for proc in self._selected_processes():
             pid = int(proc.UniqueProcessId)
+            ppid = int(proc.InheritedFromUniqueProcessId)
             name = self._main_module_name(proc)
-            layer_name = proc.add_process_layer()
+            ctime = self._create_time(proc)
+            try:
+                layer_name = proc.add_process_layer()
+            except exceptions.InvalidAddressException:
+                continue
             base = self._image_base(proc)
             if base is None:
                 continue
             try:
                 pe_data = self._reconstruct_pe(base, layer_name)
-                if _pefile is None:
-                    sections = "pefile not available"
-                else:
-                    pe_obj = _pefile.PE(data=pe_data, fast_load=True)
-                    sections = ", ".join(self._section_names(pe_obj))
             except (exceptions.VolatilityException, ValueError) as reason:
                 vollog.debug("%s (%d): %s", name, pid, reason)
                 continue
-            yield (0, (name, pid, sections))
+            for sec in self._process_section(section, pe_data):
+                sec_str = "pe:{0}".format(sec["section"]) if sec["section"] else "pe"
+                yield (name, pid, ppid, ctime, sec_str), sec["data"]
 
-    def _hash_generator(self, engines, compare_hashes):
-        strings = self.config["strings"]
+    def _full_prefixes(self):
+        for proc in self._selected_processes():
+            pid = int(proc.UniqueProcessId)
+            ppid = int(proc.InheritedFromUniqueProcessId)
+            name = self._main_module_name(proc)
+            ctime = self._create_time(proc)
+            try:
+                proc_layer_name = proc.add_process_layer()
+            except exceptions.InvalidAddressException:
+                continue
+            proc_layer = self.context.layers[proc_layer_name]
+            data = self._read_full(proc_layer)
+            yield (name, pid, ppid, ctime, "full"), data
+
+    def _dll_prefixes(self):
         section = self.config.get("section", None)
+        for proc in self._selected_processes():
+            pid = int(proc.UniqueProcessId)
+            ppid = int(proc.InheritedFromUniqueProcessId)
+            name = self._main_module_name(proc)
+            try:
+                proc_layer_name = proc.add_process_layer()
+                entries = list(proc.load_order_modules())
+            except exceptions.InvalidAddressException:
+                continue
+            for entry in entries:
+                try:
+                    base = int(entry.DllBase)
+                    mod_name = str(entry.BaseDllName.get_string())
+                    end = base + int(entry.SizeOfImage)
+                except exceptions.InvalidAddressException:
+                    continue
+                try:
+                    pe_data = self._reconstruct_pe(base, proc_layer_name)
+                except (exceptions.VolatilityException, ValueError) as reason:
+                    vollog.debug("%s (%d) %s: %s", name, pid, mod_name, reason)
+                    continue
+                for sec in self._process_section(section, pe_data):
+                    label = (
+                        "{0}:{1}".format(mod_name, sec["section"])
+                        if sec["section"]
+                        else mod_name
+                    )
+                    prefix = (
+                        name,
+                        pid,
+                        ppid,
+                        format_hints.Hex(base),
+                        format_hints.Hex(end),
+                        label,
+                    )
+                    yield prefix, sec["data"]
+
+    def _vad_prefixes(self):
+        kernel = self.context.modules[self.config["kernel"]]
+        protect_values = vadinfo.VadInfo.protect_values(
+            self.context, kernel.layer_name, kernel.symbol_table_name
+        )
+
+        def size_filter(vad):
+            # Skip any region larger than 1 GiB (matches the original plugin).
+            try:
+                return vad.get_size() >= 0x40000000
+            except exceptions.InvalidAddressException:
+                return True
 
         for proc in self._selected_processes():
             pid = int(proc.UniqueProcessId)
             ppid = int(proc.InheritedFromUniqueProcessId)
             name = self._main_module_name(proc)
             try:
-                ctime = proc.get_create_time()
-            except exceptions.VolatilityException:
-                ctime = renderers.UnreadableValue()
-
-            layer_name = proc.add_process_layer()
-            base = self._image_base(proc)
-            if base is None:
+                proc_layer_name = proc.add_process_layer()
+            except exceptions.InvalidAddressException:
                 continue
+            proc_layer = self.context.layers[proc_layer_name]
+            for vad in vadinfo.VadInfo.list_vads(proc, filter_func=size_filter):
+                try:
+                    start = vad.get_start()
+                    end = vad.get_end()
+                    size = vad.get_size()
+                    protection = vad.get_protection(
+                        protect_values, vadinfo.winnt_protections
+                    )
+                except exceptions.InvalidAddressException:
+                    continue
+                file_name = vad.get_file_name()
+                file_str = (
+                    ""
+                    if isinstance(file_name, interfaces.renderers.BaseAbsentValue)
+                    else str(file_name)
+                )
+                if self._filter_vad(protection, file_str):
+                    continue
+                data = self._read_range(proc_layer, start, size)
+                prefix = (
+                    name,
+                    pid,
+                    ppid,
+                    format_hints.Hex(start),
+                    format_hints.Hex(end),
+                    protection,
+                    file_str,
+                )
+                yield prefix, data
 
+    def _driver_prefixes(self):
+        section = self.config.get("section", None)
+        session_layers = list(
+            modules.Modules.get_session_layers(
+                context=self.context, kernel_module_name=self.config["kernel"]
+            )
+        )
+        for mod in modules.Modules.list_modules(
+            self.context, kernel_module_name=self.config["kernel"]
+        ):
+            base = int(mod.DllBase)
+            end = base + int(mod.SizeOfImage)
             try:
-                pe_data = self._reconstruct_pe(base, layer_name)
-            except (exceptions.VolatilityException, ValueError) as reason:
-                vollog.debug("%s (%d): %s", name, pid, reason)
+                path = str(mod.FullDllName.get_string())
+            except exceptions.InvalidAddressException:
+                path = ""
+            session_layer_name = modules.Modules.find_session_layer(
+                self.context, session_layers, base
+            )
+            if not session_layer_name:
                 continue
-
+            try:
+                pe_data = self._reconstruct_pe(base, session_layer_name)
+            except (exceptions.VolatilityException, ValueError) as reason:
+                vollog.debug("driver %#x: %s", base, reason)
+                continue
             for sec in self._process_section(section, pe_data):
-                data = _ascii_strings(sec["data"]) if strings else sec["data"]
                 sec_str = "pe:{0}".format(sec["section"]) if sec["section"] else "pe"
-                for engine in engines:
-                    digest = engine.calculate(data)
-                    base_row = (name, pid, ppid, ctime, sec_str, engine.name, str(digest))
-                    if compare_hashes:
-                        for other in compare_hashes:
-                            rate = engine.compare(other, str(digest))
-                            yield (0, base_row + (str(other), str(rate)))
-                    else:
-                        yield (0, base_row)
+                prefix = (
+                    format_hints.Hex(base),
+                    format_hints.Hex(end),
+                    path,
+                    sec_str,
+                )
+                yield prefix, sec["data"]
+
+    # -- common row emitter ------------------------------------------------
+    def _emit_rows(self, prefixes, engines, compare_hashes):
+        strings = self.config["strings"]
+        for prefix, data in prefixes:
+            blob = _ascii_strings(data) if strings else data
+            for engine in engines:
+                digest = str(engine.calculate(blob))
+                row = prefix + (engine.name, digest)
+                if compare_hashes:
+                    for other in compare_hashes:
+                        rate = engine.compare(other, digest)
+                        yield (0, row + (str(other), str(rate)))
+                else:
+                    yield (0, row)
+
+    # -- list-sections ------------------------------------------------------
+    def _list_sections_generator(self):
+        mode = self.config["mode"]
+        if mode == "dll":
+            for proc in self._selected_processes():
+                pid = int(proc.UniqueProcessId)
+                try:
+                    proc_layer_name = proc.add_process_layer()
+                    entries = list(proc.load_order_modules())
+                except exceptions.InvalidAddressException:
+                    continue
+                for entry in entries:
+                    try:
+                        base = int(entry.DllBase)
+                        mod_name = str(entry.BaseDllName.get_string())
+                    except exceptions.InvalidAddressException:
+                        continue
+                    secs = self._pe_section_list(base, proc_layer_name)
+                    if secs is not None:
+                        yield (0, ("{0} ({1})".format(mod_name, pid), secs))
+        elif mode == "driver":
+            session_layers = list(
+                modules.Modules.get_session_layers(
+                    context=self.context, kernel_module_name=self.config["kernel"]
+                )
+            )
+            for mod in modules.Modules.list_modules(
+                self.context, kernel_module_name=self.config["kernel"]
+            ):
+                base = int(mod.DllBase)
+                try:
+                    mod_name = str(mod.BaseDllName.get_string())
+                except exceptions.InvalidAddressException:
+                    mod_name = ""
+                session_layer_name = modules.Modules.find_session_layer(
+                    self.context, session_layers, base
+                )
+                if not session_layer_name:
+                    continue
+                secs = self._pe_section_list(base, session_layer_name)
+                if secs is not None:
+                    yield (0, (mod_name, secs))
+        else:  # pe
+            for proc in self._selected_processes():
+                pid = int(proc.UniqueProcessId)
+                name = self._main_module_name(proc)
+                try:
+                    layer_name = proc.add_process_layer()
+                except exceptions.InvalidAddressException:
+                    continue
+                base = self._image_base(proc)
+                if base is None:
+                    continue
+                secs = self._pe_section_list(base, layer_name)
+                if secs is not None:
+                    yield (0, ("{0} ({1})".format(name, pid), secs))
 
     # -- entry point --------------------------------------------------------
     def run(self):
@@ -476,8 +744,13 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
             self.context, self.config_path, "windows", "pe", class_types=pe.class_types
         )
 
+        mode = self.config["mode"]
+
         if self.config["list-sections"]:
-            columns = [("Process", str), ("PID", int), ("Sections", str)]
+            columns = [("Name", str), ("Sections", str)]
+            if mode in ("vad", "full"):
+                vollog.error("--list-sections is not supported for mode '%s'", mode)
+                return renderers.TreeGrid(columns, iter(()))
             return renderers.TreeGrid(columns, self._list_sections_generator())
 
         engines = self._get_engines()
@@ -486,16 +759,40 @@ class ProcessFuzzyHash(interfaces.plugins.PluginInterface):
             return renderers.TreeGrid([("Process", str)], iter(()))
 
         compare_hashes = self._compare_hashes()
-        columns = [
-            ("Process", str),
-            ("PID", int),
-            ("PPID", int),
-            ("Create Time", datetime.datetime),
-            ("Section", str),
-            ("Algorithm", str),
-            ("Generated Hash", str),
-        ]
+
+        proc_cols = [("Process", str), ("PID", int), ("PPID", int)]
+        if mode == "pe":
+            columns = proc_cols + [("Create Time", datetime.datetime), ("Section", str)]
+            prefixes = self._pe_prefixes()
+        elif mode == "full":
+            columns = proc_cols + [("Create Time", datetime.datetime), ("Section", str)]
+            prefixes = self._full_prefixes()
+        elif mode == "dll":
+            columns = proc_cols + [
+                ("Module Base", format_hints.Hex),
+                ("Module End", format_hints.Hex),
+                ("Module Name", str),
+            ]
+            prefixes = self._dll_prefixes()
+        elif mode == "vad":
+            columns = proc_cols + [
+                ("Start", format_hints.Hex),
+                ("End", format_hints.Hex),
+                ("Protection", str),
+                ("FileName", str),
+            ]
+            prefixes = self._vad_prefixes()
+        else:  # driver
+            columns = [
+                ("Module Base", format_hints.Hex),
+                ("Module End", format_hints.Hex),
+                ("Module Path", str),
+                ("Section", str),
+            ]
+            prefixes = self._driver_prefixes()
+
+        columns = columns + [("Algorithm", str), ("Generated Hash", str)]
         if compare_hashes:
             columns += [("Compared Hash", str), ("Rate", str)]
 
-        return renderers.TreeGrid(columns, self._hash_generator(engines, compare_hashes))
+        return renderers.TreeGrid(columns, self._emit_rows(prefixes, engines, compare_hashes))
